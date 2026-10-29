@@ -8,19 +8,26 @@ AuthenticationMode ExistingContext (default) uses your current Azure sign-in.
 Interactive signs in a person; ServicePrincipal signs in unattended using a
 TenantId, ClientId, and SecureString ClientSecret supplied by your secret store.
 The CSV requires a MachineName column containing Azure Arc resource names.
+CsvPath defaults to ..\examples\machine-names.csv relative to this script.
+Interactive authentication prompts for the CSV path when CsvPath is omitted;
+press Enter to accept the displayed default. Other modes never prompt for it.
+Custom relative paths use the current working directory. Matching surrounding
+single or double quotes pasted into a path value are removed.
 All machines must be in ResourceGroupName. LicenseResourceGroupName defaults to it.
 This script is self-contained; no companion scripts or modules beyond Az.Accounts are needed.
 Stops on the first failure; earlier assignments are not rolled back.
+Displays the selected Azure identity and checks caller permissions for all
+targets before submitting any assignments, including during -WhatIf.
 .EXAMPLE
-.\WS2016_ESU_License_CSV.ps1 -CsvPath .\machine-names.csv -SubscriptionId '<guid>' -ResourceGroupName 'ArcDemoLab' -EsuLicenseName 'WS2016ESUDemo' -WhatIf
+.\WS2016_ESU_License_CSV.ps1 -SubscriptionId '<guid>' -ResourceGroupName 'ArcDemoLab' -EsuLicenseName 'WS2016ESUDemo' -WhatIf
 .EXAMPLE
-.\WS2016_ESU_License_CSV.ps1 -CsvPath .\machine-names.csv -SubscriptionId '<guid>' -ResourceGroupName 'ArcDemoLab' -EsuLicenseName 'WS2016ESUDemo' -AuthenticationMode Interactive -TenantId '<tenant-guid>'
+.\WS2016_ESU_License_CSV.ps1 -SubscriptionId '<guid>' -ResourceGroupName 'ArcDemoLab' -EsuLicenseName 'WS2016ESUDemo' -AuthenticationMode Interactive -TenantId '<tenant-guid>'
 .EXAMPLE
-.\WS2016_ESU_License_CSV.ps1 -CsvPath .\machine-names.csv -SubscriptionId '<guid>' -ResourceGroupName 'ArcDemoLab' -EsuLicenseName 'WS2016ESUDemo' -AuthenticationMode ServicePrincipal -TenantId '<tenant-guid>' -ClientId '<application-guid>' -ClientSecret $secret -Confirm:$false
+.\WS2016_ESU_License_CSV.ps1 -SubscriptionId '<guid>' -ResourceGroupName 'ArcDemoLab' -EsuLicenseName 'WS2016ESUDemo' -AuthenticationMode ServicePrincipal -TenantId '<tenant-guid>' -ClientId '<application-guid>' -ClientSecret $secret -Confirm:$false
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
-    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CsvPath,
+    [string]$CsvPath,
     [Parameter(Mandatory)][guid]$SubscriptionId,
     [Parameter(Mandatory)][ValidatePattern('^[\w().-]+$')][string]$ResourceGroupName,
     [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9_.-]+$')][string]$EsuLicenseName,
@@ -34,6 +41,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $PSBoundParameters.ContainsKey('CsvPath')) {
+    $CsvPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\examples\machine-names.csv'))
+}
 if ($AuthenticationMode -eq 'ExistingContext') {
     if ($PSBoundParameters.ContainsKey('TenantId') -or
         $PSBoundParameters.ContainsKey('ClientId') -or
@@ -53,6 +63,12 @@ else {
     }
     elseif ($PSBoundParameters.ContainsKey('ClientId') -or $PSBoundParameters.ContainsKey('ClientSecret')) {
         throw 'Interactive authentication does not accept ClientId or ClientSecret. Choose ServicePrincipal for unattended execution.'
+    }
+}
+if ($AuthenticationMode -eq 'Interactive' -and -not $PSBoundParameters.ContainsKey('CsvPath')) {
+    $enteredPath = Read-Host "CSV path [$CsvPath] (press Enter to accept)"
+    if (-not [string]::IsNullOrWhiteSpace($enteredPath)) {
+        $CsvPath = $enteredPath
     }
 }
 function Get-ArcEsuContext {
@@ -91,14 +107,15 @@ function Assert-ArcEsuResourceId {
 function Invoke-ArcEsuRequest {
     param(
         [Parameter(Mandatory)][string]$ResourceId,
-        [Parameter(Mandatory)][ValidateSet('GET', 'PUT')][string]$Method,
+        [Parameter(Mandatory)][ValidateSet('GET', 'PUT', 'PATCH')][string]$Method,
         [Parameter(Mandatory)]$Context,
         [hashtable]$Body,
-        [switch]$AllowNotFound
+        [switch]$AllowNotFound,
+        [string]$ApiVersion = '2023-06-20-preview'
     )
 
     $parameters = @{
-        Path = "${ResourceId}?api-version=2023-06-20-preview"
+        Path = if ($ResourceId.Contains('?')) { $ResourceId } else { "${ResourceId}?api-version=$ApiVersion" }
         Method = $Method
         DefaultProfile = $Context
         ErrorAction = 'Stop'
@@ -126,6 +143,61 @@ function Invoke-ArcEsuRequest {
     }
     if (-not [string]::IsNullOrWhiteSpace($response.Content)) {
         return ($response.Content | ConvertFrom-Json -ErrorAction Stop)
+    }
+}
+
+function Assert-ArcEsuPermission {
+    param(
+        [Parameter(Mandatory)][string]$ResourceId,
+        [Parameter(Mandatory)][string[]]$Actions,
+        [Parameter(Mandatory)]$Context
+    )
+
+    $path = "$ResourceId/providers/Microsoft.Authorization/permissions"
+    $permissions = @()
+    $visited = @{}
+    do {
+        if ($visited.ContainsKey($path)) {
+            throw "Permission preflight received a repeated pagination link for $ResourceId. No assignments were submitted."
+        }
+        $visited[$path] = $true
+        try {
+            $page = Invoke-ArcEsuRequest -ResourceId $path -Method GET -Context $Context -ApiVersion '2022-04-01'
+        }
+        catch {
+            throw "Unable to verify caller permissions for '$ResourceId': $($_.Exception.Message) No assignments were submitted. Permission inspection failed; this does not by itself prove the ESU action is denied."
+        }
+        if (-not $page -or 'value' -notin $page.PSObject.Properties.Name) {
+            throw "Permission preflight returned an invalid response for $ResourceId. No assignments were submitted."
+        }
+        $permissions += @($page.value)
+        $path = $null
+        if ($page.nextLink) {
+            $next = $null
+            if (-not [uri]::TryCreate($page.nextLink, [UriKind]::Absolute, [ref]$next) -or
+                $next.Scheme -ne 'https' -or $next.Host -ne 'management.azure.com' -or
+                -not $next.IsDefaultPort -or $next.UserInfo -or $next.Fragment -or
+                $next.AbsolutePath -ine "$ResourceId/providers/Microsoft.Authorization/permissions") {
+                throw "Permission preflight returned an unexpected pagination URL for $ResourceId. No assignments were submitted."
+            }
+            $path = $next.PathAndQuery
+        }
+    } while ($path)
+
+    foreach ($action in $Actions) {
+        $allowed = $false
+        foreach ($permission in $permissions) {
+            $included = @($permission.actions | Where-Object { $action -like $_ }).Count -gt 0
+            $excluded = @($permission.notActions | Where-Object { $action -like $_ }).Count -gt 0
+            # NotActions subtracts from this grant, not from other role grants.
+            if ($included -and -not $excluded) {
+                $allowed = $true
+                break
+            }
+        }
+        if (-not $allowed) {
+            throw "RBAC preflight: account '$($Context.Account.Id)' (type '$($Context.Account.Type)', tenant '$($Context.Tenant.Id)') lacks '$action' at '$ResourceId'. No assignments were submitted. Use -AuthenticationMode ServicePrincipal with your authorized application, or have an administrator grant Azure Connected Machine Resource Administrator at the appropriate scope and refresh your sign-in."
+        }
     }
 }
 
@@ -157,6 +229,7 @@ function Set-ArcWs2016EsuLicense {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$MachineResourceId,
         [ValidateSet('Link', 'Unlink')][string]$Action = 'Link',
         [string]$LicenseResourceId,
+        [Parameter(Mandatory)]$Context,
         [switch]$ReplaceExisting,
         [ValidateRange(1, 120)][int]$VerificationAttempts = 12,
         [ValidateRange(1, 60)][int]$VerificationDelaySeconds = 5
@@ -168,7 +241,7 @@ function Set-ArcWs2016EsuLicense {
     if ($Action -eq 'Unlink' -and ($LicenseResourceId -or $ReplaceExisting)) {
         throw 'Do not supply LicenseResourceId or ReplaceExisting for Unlink.'
     }
-    $context = Get-ArcEsuContext
+    $context = $Context
     Assert-ArcEsuResourceId -ResourceId $MachineResourceId -ResourceType machines -Context $context
     if ($Action -eq 'Link') {
         Assert-ArcEsuResourceId -ResourceId $LicenseResourceId -ResourceType licenses -Context $context
@@ -218,23 +291,29 @@ function Set-ArcWs2016EsuLicense {
         return
     }
 
-    # A minimal PUT must not overwrite an unrelated subscription on the same profile.
-    if ($profile.properties.productProfile -or $profile.properties.softwareAssurance -or
+    $method = 'PUT'
+    $apiVersion = '2023-06-20-preview'
+    if ($Action -eq 'Link' -and $profile) {
+        # PATCH changes only the ESU assignment and leaves unrelated settings alone.
+        $method = 'PATCH'
+        $apiVersion = '2026-09-01'
+    }
+    elseif ($profile.properties.productProfile -or $profile.properties.softwareAssurance -or
         ($profile.tags -and @($profile.tags.PSObject.Properties).Count -gt 0)) {
-        throw 'The license profile contains non-ESU settings or tags. This sample refuses a potentially destructive PUT; review and manage this profile separately.'
+        throw 'Unlink would require a PUT on a profile with non-ESU settings or tags. Unlink this shared profile in the Azure portal instead.'
     }
     $esuProfile = @{}
     if ($Action -eq 'Link') {
         $esuProfile.assignedLicense = $LicenseResourceId
     }
-    $body = @{
-        location = $machine.location
-        properties = @{ esuProfile = $esuProfile }
+    $body = @{ properties = @{ esuProfile = $esuProfile } }
+    if ($method -eq 'PUT') {
+        $body.location = $machine.location
     }
     if (-not $PSCmdlet.ShouldProcess($MachineResourceId, "$Action ESU license assignment")) {
         return
     }
-    $null = Invoke-ArcEsuRequest -ResourceId $profileId -Method PUT -Context $context -Body $body
+    $null = Invoke-ArcEsuRequest -ResourceId $profileId -Method $method -ApiVersion $apiVersion -Context $context -Body $body
 
     for ($attempt = 1; $attempt -le $VerificationAttempts; $attempt++) {
         $profile = Invoke-ArcEsuRequest -ResourceId $profileId -Method GET -Context $context -AllowNotFound
@@ -252,9 +331,27 @@ function Set-ArcWs2016EsuLicense {
     throw "The $Action request was submitted, but the expected assignment was not observed after $VerificationAttempts reads. Inspect Azure before retrying; guest activation and patch installation were not verified."
 }
 
+$CsvPath = $CsvPath.Trim()
+if ([string]::IsNullOrWhiteSpace($CsvPath)) {
+    throw 'CsvPath must not be blank. Omit it to use examples\machine-names.csv.'
+}
+$quoteCharacters = @('"', "'")
+if ($CsvPath.Substring(0, 1) -in $quoteCharacters -or
+    $CsvPath.Substring($CsvPath.Length - 1, 1) -in $quoteCharacters) {
+    if ($CsvPath.Length -lt 3 -or $CsvPath.Substring(0, 1) -notin $quoteCharacters -or
+        $CsvPath.Substring(0, 1) -ne $CsvPath.Substring($CsvPath.Length - 1, 1)) {
+        throw 'CsvPath has unmatched surrounding quotes. Supply a path without literal quotes, or use one matching pair.'
+    }
+    $CsvPath = $CsvPath.Substring(1, $CsvPath.Length - 2).Trim()
+    if ([string]::IsNullOrWhiteSpace($CsvPath)) {
+        throw 'CsvPath must not be blank. Omit it to use examples\machine-names.csv.'
+    }
+}
 if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
     throw "CSV file not found: $CsvPath"
 }
+$CsvPath = (Resolve-Path -LiteralPath $CsvPath -ErrorAction Stop).ProviderPath
+Write-Host "CSV input: $CsvPath"
 $rows = @(Import-Csv -LiteralPath $CsvPath -ErrorAction Stop)
 if ($rows.Count -eq 0) {
     throw 'The CSV must contain at least one machine and a MachineName column.'
@@ -300,10 +397,29 @@ if (-not $LicenseResourceGroupName) {
     $LicenseResourceGroupName = $ResourceGroupName
 }
 $licenseId = "/subscriptions/$SubscriptionId/resourceGroups/$LicenseResourceGroupName/providers/Microsoft.HybridCompute/licenses/$EsuLicenseName"
+$context = Get-ArcEsuContext
+Assert-ArcEsuResourceId -ResourceId $licenseId -ResourceType licenses -Context $context
+Write-Host "Azure identity: $($context.Account.Id) | Type: $($context.Account.Type) | Tenant: $($context.Tenant.Id) | Subscription: $($context.Subscription.Id) | Mode: $AuthenticationMode"
+
+Assert-ArcEsuPermission -ResourceId $licenseId -Actions 'Microsoft.HybridCompute/licenses/read' -Context $context
+$null = Invoke-ArcEsuRequest -ResourceId $licenseId -Method GET -Context $context
+foreach ($name in $machineNames) {
+    $machineId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.HybridCompute/machines/$name"
+    Assert-ArcEsuPermission -ResourceId $machineId -Actions 'Microsoft.HybridCompute/machines/read' -Context $context
+    Assert-ArcEsuPermission -ResourceId "$machineId/licenseProfiles/default" -Actions @(
+        'Microsoft.HybridCompute/machines/licenseProfiles/read'
+        'Microsoft.HybridCompute/machines/licenseProfiles/write'
+    ) -Context $context
+    $null = Invoke-ArcEsuRequest -ResourceId $machineId -Method GET -Context $context
+    $null = Invoke-ArcEsuRequest -ResourceId "$machineId/licenseProfiles/default" -Method GET -Context $context -AllowNotFound
+}
+Write-Host "Permission preflight passed for $($machineNames.Count) machine(s). Azure still enforces authorization on each assignment."
+
 foreach ($name in $machineNames) {
     $parameters = @{
         MachineResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.HybridCompute/machines/$name"
         LicenseResourceId = $licenseId
+        Context = $context
         ReplaceExisting = $ReplaceExisting
         WhatIf = [bool]$WhatIfPreference
         ErrorAction = 'Stop'

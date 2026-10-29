@@ -115,11 +115,21 @@ Authorization: Bearer <managed-by-Az.Accounts>
 }
 ```
 
-The sample deliberately uses the **preview API version in the supplied ESU guide**, not an unverified replacement. The existence of newer API versions does not prove that the undocumented 2016 core-selection behavior is covered.
+The original single-machine script and the CSV script's profile creation request
+use the **preview API version in the supplied ESU guide**. For an existing
+profile, the CSV script uses the documented **PATCH API version 2026-09-01** to
+update only `properties.esuProfile.assignedLicense`. See
+[License Profiles - Update](https://learn.microsoft.com/en-us/rest/api/hybridcompute/license-profiles/update?view=rest-hybridcompute-2026-09-01).
+The PATCH body omits `location`, tags, Software Assurance, and product settings;
+it does not copy read-only response fields into the request. This preserves
+unrelated settings instead of blocking assignment merely because they exist.
+If the profile does not exist, the script creates it with the original PUT
+payload shown above. The core-type documentation gap remains unchanged.
 
 After submission, the **CSV script** reads back the profile up to 12 times, with five seconds between reads, and reports `Linked` only when `assignedLicense` matches. If it already matches, it reports `AlreadyLinked` without a write. A timeout explicitly states that a request was submitted but not verified; inspect the current state before retrying.
 
-To prevent a minimal PUT from overwriting unrelated profile configuration, the **CSV script** refuses a change when the existing profile contains product subscription settings, Software Assurance settings, or nonempty profile tags. Manage those shared profiles separately. It never writes to the parent machine resource.
+The CSV script never writes to the parent machine resource. Existing-profile
+assignment updates use the targeted PATCH, rather than a replacement PUT.
 
 ## 4. Link a reviewed list of machines
 
@@ -139,11 +149,35 @@ WS2016-01
 WS2016-02
 ```
 
+`-CsvPath` is optional: by default the script loads
+`examples\machine-names.csv` from the repository/deployment folder, located
+relative to the script itself rather than the current working directory.
+Keep the `scripts` and `examples` folder layout when copying it to another host.
+The script prints the resolved CSV path before authentication and preflight.
+
+With `-AuthenticationMode Interactive`, omitting `-CsvPath` displays a prompt
+such as:
+
+```text
+CSV path [C:\Scripts\examples\machine-names.csv] (press Enter to accept):
+```
+
+Press **Enter** to accept the displayed path, or type another path. Supplying
+`-CsvPath` skips this prompt. `ServicePrincipal` and `ExistingContext` modes
+never prompt for the CSV path, so unattended runs remain noninteractive.
+
+To use another file, supply `-CsvPath "C:\ESU Inputs\machines.csv"`.
+Normal PowerShell command-line quotes are valid and required for paths with
+spaces; they are not part of the resulting value. If quotes were pasted into a
+parameter value (for example, from a prompt or automation variable), the script
+removes one matching pair of surrounding single or double quotes. Unmatched
+quotes produce an explicit error. Explicit relative paths are still relative
+to your current working directory.
+
 Sign in and select the subscription as described above, then preview:
 
 ```powershell
 $parameters = @{
-    CsvPath = '.\examples\machine-names.csv'
     SubscriptionId = '<subscription-guid>'
     ResourceGroupName = 'ArcDemoLab'
     EsuLicenseName = 'WS2016ESUDemo'
@@ -157,13 +191,38 @@ Run the assignments after reviewing the preview:
 .\scripts\WS2016_ESU_License_CSV.ps1 @parameters
 ```
 
-The CSV script supports both individual use and unattended Chef automation:
+The CSV script supports both individual use and unattended automation:
 
 | AuthenticationMode | Behavior |
 | --- | --- |
 | `ExistingContext` (default) | Uses the existing `Connect-AzAccount` session; no sign-in prompt is initiated by the script. |
 | `Interactive` | Signs in a person for the specified tenant and subscription. |
 | `ServicePrincipal` | Signs in unattended with the supplied application ID and secret; never falls back to interactive sign-in. |
+
+**Which identity is used?** `ExistingContext` reads the current `Az.Accounts`
+context (`Get-AzContext`), which can have been restored from an earlier Azure
+sign-in. It is not necessarily your Windows account and might be a service
+principal rather than a person. The script now prints the account ID/type,
+tenant, subscription, and authentication mode before its permission preflight.
+It pins that context for the run; it never prints a token or secret.
+
+Before any license assignments, the CSV script queries the Azure Authorization
+[caller permissions API](https://learn.microsoft.com/en-us/rest/api/authorization/permissions/list-for-resource?view=rest-authorization-2022-04-01)
+at the license, each machine, and each machine's license profile. It checks
+license read, machine read, and profile read/write actions, accounting for
+wildcard grants and each grant's `NotActions`. It also reads all target machines,
+their profiles, and the license to detect actual read failures before any writes.
+If any target lacks a required action, it stops with the identity, action, scope,
+and guidance to use the authorized service principal or request the correct role.
+
+This preflight runs with `-WhatIf` too. A failure to inspect permissions stops the
+run explicitly; it is not misreported as proof that the ESU operation is denied.
+The caller must be able to query its permissions at these scopes; if that API
+returns an authorization error, have an administrator review the identity's
+`Microsoft.Authorization/permissions/read` access as well.
+The check is not a guarantee of a future write: deny assignments, conditions,
+policy, PIM activation, role propagation, or access changes can still cause Azure
+to reject a request. Ordinary per-request error handling remains in place.
 
 For an individual operator, the script can handle sign-in:
 
@@ -174,8 +233,32 @@ For an individual operator, the script can handle sign-in:
     -WhatIf
 ```
 
-For Chef, retrieve the secret from your approved secret store into the PowerShell
-process, convert it to a `SecureString` if necessary, and pass it to the script:
+For a manual run using a service principal, **run this first in the same
+PowerShell session** to enter the secret securely:
+
+```powershell
+$secret = Read-Host 'New service principal secret' -AsSecureString
+```
+
+Then pass `$secret` to the script using the `$parameters` configuration above:
+
+```powershell
+.\scripts\WS2016_ESU_License_CSV.ps1 @parameters `
+    -AuthenticationMode ServicePrincipal `
+    -TenantId '<tenant-guid>' `
+    -ClientId '<application-client-guid>' `
+    -ClientSecret $secret `
+    -Confirm:$false
+```
+
+`-ClientSecret` requires a `SecureString`; a quoted plaintext value will fail
+parameter binding. Never paste the secret into the command itself, source code,
+or chat. If a secret has been exposed, revoke it and create a replacement first.
+The `Read-Host` step is for manual runs only, not unattended execution.
+
+For unattended automation, retrieve the secret from your approved secret store
+into the PowerShell process, convert it to a `SecureString` if necessary, and
+pass it to the script:
 
 ```powershell
 # $clientSecretSecure is a nonempty SecureString obtained from your secret store.
@@ -188,13 +271,46 @@ process, convert it to a `SecureString` if necessary, and pass it to the script:
 ```
 
 `$clientSecretSecure` is deliberately not populated with a literal secret in
-this example. Do not put secrets in the CSV, recipe source, generated script
-files, command-line arguments, or Chef logs. Run the invocation inside Chef's
-PowerShell execution context and mark secret-bearing Chef resources as
-`sensitive true`. Ensure `Az.Accounts` is installed for the Chef execution
-identity, and assign that service principal the required resource-group RBAC
-permissions. Missing credentials and authentication errors terminate execution;
-run Chef's PowerShell host with `-NonInteractive` as an additional safeguard.
+this example. Do not put secrets in the CSV, automation source, generated script
+files, command-line arguments, or logs. Configure your automation platform to
+redact secret-bearing inputs and output. Ensure `Az.Accounts` is installed for
+the automation execution identity, and assign that service principal the required
+resource-group RBAC permissions. Missing credentials and authentication errors
+terminate execution; run the PowerShell host with `-NonInteractive` as an
+additional safeguard.
+
+**Azure Key Vault is another option for storing the service-principal secret.**
+Retrieve it at runtime rather than embedding it in the script or configuration.
+For example, on a host that supports managed identity, use that identity to read
+the secret, then pass the returned `SecureString` to the service-principal
+invocation above:
+
+```powershell
+# Requires the optional Az.KeyVault module and a configured managed identity.
+Import-Module Az.KeyVault -ErrorAction Stop
+Connect-AzAccount -Identity -Scope Process -ErrorAction Stop | Out-Null
+$vaultSecret = Get-AzKeyVaultSecret `
+    -VaultName '<key-vault-name>' `
+    -Name '<service-principal-secret-name>' `
+    -ErrorAction Stop
+if (-not $vaultSecret -or -not $vaultSecret.SecretValue) {
+    throw 'The service-principal secret could not be retrieved from Key Vault.'
+}
+$clientSecretSecure = $vaultSecret.SecretValue
+```
+
+The retrieving identity needs network access to the vault and permission to read
+the secret, such as **Key Vault Secrets User** at the appropriate scope for a
+vault using Azure RBAC, or **Get** secret permission for an access-policy vault.
+This initial identity must authenticate independently; storing the secret in
+Key Vault does not remove that requirement. The service principal used for ESU
+assignment still needs its separate Arc RBAC permissions. Do not use
+`-AsPlainText` or print the retrieved secret. If the managed identity already has
+the required Arc permissions, you can instead use `ExistingContext` directly
+without a service-principal secret.
+
+See [Get-AzKeyVaultSecret](https://learn.microsoft.com/en-us/powershell/module/az.keyvault/get-azkeyvaultsecret)
+and [Azure Key Vault RBAC guidance](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide).
 
 The script's explicit sign-in modes use process-scoped Azure context and disable
 context autosave for the process. Authentication and preflight reads still occur
@@ -303,7 +419,7 @@ Unlink is also allowed for upgraded or disconnected machines so stale assignment
 | OS/version/connectivity preflight failure | Upgrade the agent, restore Arc connectivity, or wait for current inventory. Do not bypass these checks to force an assignment. |
 | Deactivated/wrong-target license | Select an activated 2016 ESU license; do not activate or repurpose a 2012 license blindly. |
 | Existing different assignment | Review it, then use `-ReplaceExisting` only if the replacement is intended. |
-| Shared profile refused | Review product/Software Assurance settings and tags; this sample intentionally avoids overwriting them. |
+| Existing profile has other settings/tags | The CSV script updates only the ESU assignment using PATCH; unrelated fields are not sent or replaced. |
 | Assignment accepted, guest not Active | Check timing, connectivity, certificate authorities, agent diagnostics, and enrollment in the portal. Do not equate assignment with activation. |
 | Core type unclear or API validation error | Use the portal's explicit 2016 core selection and consult Microsoft about the API documentation gap before scaling automation. |
 | Verification timeout | Read the profile again; the write may already have succeeded. Do not report the machine as verified until the expected ID is observed. |
